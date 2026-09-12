@@ -1,0 +1,438 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Pixtra Entity Graph</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: #0D2818; overflow: hidden; font-family: "Segoe UI", sans-serif; }
+  #graph { width: 100vw; height: 100vh; }
+  #hud {
+    position: absolute; top: 8px; left: 8px; right: 8px;
+    display: flex; gap: 6px; z-index: 10;
+    font-size: 11px; color: #C2DDCE;
+  }
+  .mode-btn {
+    padding: 4px 10px; background: rgba(13,40,24,0.85);
+    color: #C2DDCE; border: 1px solid #14432A; cursor: pointer;
+    font-family: inherit; font-size: 11px; font-weight: 600;
+  }
+  .mode-btn.active { background: #1B5E3B; color: #FFFFFF; border-color: #2A9461; }
+  #stats { margin-left: auto; padding: 4px 10px; background: rgba(13,40,24,0.85); border: 1px solid #14432A; }
+  #detail {
+    position: absolute; bottom: 8px; left: 8px; max-width: 320px;
+    background: rgba(13,40,24,0.92); color: #FFFFFF; padding: 10px 12px;
+    border: 1px solid #2A9461; display: none; z-index: 10;
+    font-size: 11px; line-height: 1.45;
+  }
+  #detail h3 { margin: 0 0 4px; font-size: 13px; font-weight: 700; }
+  #detail .kv { color: #C2DDCE; }
+  #detail ul { margin: 4px 0 0; padding-left: 16px; max-height: 120px; overflow-y: auto; }
+  #detail ul::-webkit-scrollbar { width: 4px; }
+  #detail ul::-webkit-scrollbar-thumb { background: #2A9461; }
+  #status { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); color: #C2DDCE; font-size: 14px; }
+</style>
+</head>
+<body>
+<div id="graph"></div>
+<div id="hud">
+  <button class="mode-btn active" data-mode="force">Force-Directed</button>
+  <button class="mode-btn" data-mode="centralized">Centralized</button>
+  <button class="mode-btn" data-mode="decentralized">Decentralized</button>
+  <button class="mode-btn" id="reset-btn">Reset View</button>
+  <span id="stats"></span>
+</div>
+<div id="detail"></div>
+<div id="status">Awaiting graph data...</div>
+<script src="three.min.js"></script>
+<script src="3d-force-graph.min.js"></script>
+<script>
+(function () {
+  "use strict";
+
+  const TYPE_COLORS = {
+    person: "#3BAF78",
+    phone: "#1565C0",
+    number: "#1565C0",
+    location: "#E65100",
+    app: "#6A1B9A",
+    device: "#C62828",
+    file: "#C62828",
+  };
+
+  const MAX_NODES = 500;
+  const MAX_EDGES = 2000;
+
+  let Graph = null;
+  let rawData = { nodes: [], links: [] };
+  let neighborsIndex = new Map();
+  let focusedId = null;
+  let filteredSet = null;
+  let currentMode = "force";
+
+  function buildNeighborsIndex(links) {
+    const idx = new Map();
+    for (const l of links) {
+      const s = typeof l.source === "object" ? l.source.id : l.source;
+      const t = typeof l.target === "object" ? l.target.id : l.target;
+      if (!idx.has(s)) idx.set(s, new Set());
+      if (!idx.has(t)) idx.set(t, new Set());
+      idx.get(s).add(t);
+      idx.get(t).add(s);
+    }
+    return idx;
+  }
+
+  function connectionCount(nodeId) {
+    return (neighborsIndex.get(nodeId) || new Set()).size;
+  }
+
+  function capSize(nodes, links) {
+    if (nodes.length <= MAX_NODES && links.length <= MAX_EDGES) {
+      return { nodes, links, capped: false };
+    }
+    const tmpIdx = buildNeighborsIndex(links);
+    const sorted = [...nodes].sort(
+      (a, b) =>
+        (tmpIdx.get(b.id) || new Set()).size -
+        (tmpIdx.get(a.id) || new Set()).size
+    );
+    const topNodes = sorted.slice(0, MAX_NODES);
+    const topIds = new Set(topNodes.map((n) => n.id));
+    let topLinks = links.filter((l) => {
+      const s = typeof l.source === "object" ? l.source.id : l.source;
+      const t = typeof l.target === "object" ? l.target.id : l.target;
+      return topIds.has(s) && topIds.has(t);
+    });
+    if (topLinks.length > MAX_EDGES) topLinks = topLinks.slice(0, MAX_EDGES);
+    return { nodes: topNodes, links: topLinks, capped: true };
+  }
+
+  function fibonacciSphere(samples, radius) {
+    const points = [];
+    const phi = Math.PI * (Math.sqrt(5) - 1);
+    for (let i = 0; i < samples; i++) {
+      const y = 1 - (i / Math.max(1, samples - 1)) * 2;
+      const r = Math.sqrt(1 - y * y);
+      const theta = phi * i;
+      points.push({
+        x: Math.cos(theta) * r * radius,
+        y: y * radius,
+        z: Math.sin(theta) * r * radius,
+      });
+    }
+    return points;
+  }
+
+  function bfsDistances(startId, nodes, neighbors) {
+    const dist = new Map();
+    dist.set(startId, 0);
+    const queue = [startId];
+    while (queue.length) {
+      const cur = queue.shift();
+      const d = dist.get(cur);
+      for (const nb of neighbors.get(cur) || []) {
+        if (!dist.has(nb)) {
+          dist.set(nb, d + 1);
+          queue.push(nb);
+        }
+      }
+    }
+    for (const n of nodes) {
+      if (!dist.has(n.id)) dist.set(n.id, 99);
+    }
+    return dist;
+  }
+
+  function detectCommunities(nodes, neighbors) {
+    const labels = new Map();
+    nodes.forEach((n, i) => labels.set(n.id, i));
+    const order = nodes.map((n) => n.id);
+    for (let iter = 0; iter < 6; iter++) {
+      let changed = false;
+      for (let i = order.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [order[i], order[j]] = [order[j], order[i]];
+      }
+      for (const id of order) {
+        const counts = new Map();
+        for (const nb of neighbors.get(id) || []) {
+          const lbl = labels.get(nb);
+          counts.set(lbl, (counts.get(lbl) || 0) + 1);
+        }
+        if (!counts.size) continue;
+        let bestLbl = labels.get(id);
+        let bestCount = -1;
+        for (const [lbl, c] of counts) {
+          if (c > bestCount) {
+            bestCount = c;
+            bestLbl = lbl;
+          }
+        }
+        if (labels.get(id) !== bestLbl) {
+          labels.set(id, bestLbl);
+          changed = true;
+        }
+      }
+      if (!changed) break;
+    }
+    const communities = new Map();
+    for (const [nodeId, lbl] of labels) {
+      if (!communities.has(lbl)) communities.set(lbl, []);
+      communities.get(lbl).push(nodeId);
+    }
+    return [...communities.values()].sort((a, b) => b.length - a.length);
+  }
+
+  function applyModeForce() {
+    for (const n of rawData.nodes) {
+      delete n.fx;
+      delete n.fy;
+      delete n.fz;
+    }
+    Graph.d3ReheatSimulation();
+  }
+
+  function applyModeCentralized() {
+    if (!rawData.nodes.length) return;
+    let hub = rawData.nodes[0];
+    let hubCount = connectionCount(hub.id);
+    for (const n of rawData.nodes) {
+      const c = connectionCount(n.id);
+      if (c > hubCount) {
+        hub = n;
+        hubCount = c;
+      }
+    }
+    const dist = bfsDistances(hub.id, rawData.nodes, neighborsIndex);
+    const byShell = new Map();
+    for (const n of rawData.nodes) {
+      const d = dist.get(n.id);
+      if (!byShell.has(d)) byShell.set(d, []);
+      byShell.get(d).push(n);
+    }
+    for (const [d, shellNodes] of byShell) {
+      if (d === 0) {
+        hub.fx = 0;
+        hub.fy = 0;
+        hub.fz = 0;
+        continue;
+      }
+      const radius = d * 140;
+      const pts = fibonacciSphere(shellNodes.length, radius);
+      for (let i = 0; i < shellNodes.length; i++) {
+        shellNodes[i].fx = pts[i].x;
+        shellNodes[i].fy = pts[i].y;
+        shellNodes[i].fz = pts[i].z;
+      }
+    }
+    Graph.d3ReheatSimulation();
+  }
+
+  function applyModeDecentralized() {
+    if (!rawData.nodes.length) return;
+    const communities = detectCommunities(rawData.nodes, neighborsIndex);
+    const anchors = fibonacciSphere(communities.length, 420);
+    communities.forEach((nodeIds, ci) => {
+      const a = anchors[ci];
+      const inner = Math.max(40, Math.sqrt(nodeIds.length) * 18);
+      const pts = fibonacciSphere(nodeIds.length, inner);
+      for (let i = 0; i < nodeIds.length; i++) {
+        const n = rawData.nodes.find((x) => x.id === nodeIds[i]);
+        if (!n) continue;
+        n.fx = a.x + pts[i].x;
+        n.fy = a.y + pts[i].y;
+        n.fz = a.z + pts[i].z;
+      }
+    });
+    Graph.d3ReheatSimulation();
+  }
+
+  function setMode(mode) {
+    currentMode = mode;
+    document.querySelectorAll(".mode-btn").forEach((b) => {
+      b.classList.toggle("active", b.dataset.mode === mode);
+    });
+    if (mode === "force") applyModeForce();
+    else if (mode === "centralized") applyModeCentralized();
+    else if (mode === "decentralized") applyModeDecentralized();
+  }
+
+  function buildLabelSprite(text, color) {
+    const canvas = document.createElement("canvas");
+    const ctx = canvas.getContext("2d");
+    ctx.font = "bold 20px 'Consolas', 'JetBrains Mono', monospace";
+    const w = ctx.measureText(text).width + 20;
+    canvas.width = w;
+    canvas.height = 28;
+    const c2 = canvas.getContext("2d");
+    c2.font = "bold 20px 'Consolas', 'JetBrains Mono', monospace";
+    c2.fillStyle = "#FFFFFF";
+    c2.textBaseline = "middle";
+    c2.fillText(text, 10, 14);
+    const tex = new THREE.Texture(canvas);
+    tex.needsUpdate = true;
+    const mat = new THREE.SpriteMaterial({ map: tex, transparent: true, depthWrite: false });
+    const sprite = new THREE.Sprite(mat);
+    sprite.scale.set(w / 4, 7, 1);
+    return sprite;
+  }
+
+  function showDetail(node, neighbors) {
+    const el = document.getElementById("detail");
+    const neighborNames = [...neighbors]
+      .filter((id) => id !== node.id)
+      .map((id) => {
+        const n = rawData.nodes.find((x) => x.id === id);
+        return n ? n.name : id;
+      })
+      .slice(0, 40);
+    el.innerHTML =
+      '<h3>' + escapeHtml(node.name || node.id) + '</h3>' +
+      '<div class="kv">type: ' + escapeHtml(node.type || 'unknown') + '</div>' +
+      '<div class="kv">connections: ' + (neighbors.size - 1) + '</div>' +
+      (neighborNames.length
+        ? '<ul>' + neighborNames.map((n) => '<li>' + escapeHtml(n) + '</li>').join("") + '</ul>'
+        : '');
+    el.style.display = "block";
+  }
+
+  function hideDetail() {
+    document.getElementById("detail").style.display = "none";
+  }
+
+  function escapeHtml(s) {
+    return String(s || "").replace(/[&<>"']/g, (c) =>
+      ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])
+    );
+  }
+
+  function focusOnNode(node) {
+    focusedId = node.id;
+    const connected = new Set(neighborsIndex.get(node.id) || []);
+    connected.add(node.id);
+    Graph.nodeOpacity(0.08);
+    Graph.linkOpacity(0.06);
+    Graph.nodeVisibility((n) => (filteredSet ? filteredSet.has(n.id) : true))
+      .nodeColor((n) => {
+        const base = TYPE_COLORS[n.type] || "#3BAF78";
+        return connected.has(n.id) ? base : "#2a3a30";
+      });
+    const dist = 180;
+    const ratio = 1 + dist / Math.max(10, Math.hypot(node.x || 1, node.y || 1, node.z || 1));
+    Graph.cameraPosition(
+      { x: (node.x || 1) * ratio, y: (node.y || 1) * ratio, z: (node.z || 1) * ratio },
+      { x: node.x, y: node.y, z: node.z },
+      1400
+    );
+    showDetail(node, connected);
+  }
+
+  function resetView() {
+    focusedId = null;
+    filteredSet = null;
+    Graph.nodeOpacity(1)
+      .linkOpacity(0.35)
+      .nodeVisibility(true)
+      .nodeColor((n) => TYPE_COLORS[n.type] || "#3BAF78");
+    Graph.cameraPosition({ x: 0, y: 0, z: 600 }, { x: 0, y: 0, z: 0 }, 1200);
+    hideDetail();
+  }
+
+  function filterToNeighborhood(node, hops) {
+    const set = new Set([node.id]);
+    let frontier = new Set([node.id]);
+    for (let h = 0; h < hops; h++) {
+      const next = new Set();
+      for (const id of frontier) {
+        for (const nb of neighborsIndex.get(id) || []) {
+          if (!set.has(nb)) {
+            set.add(nb);
+            next.add(nb);
+          }
+        }
+      }
+      frontier = next;
+    }
+    filteredSet = set;
+    Graph.nodeVisibility((n) => set.has(n.id))
+      .linkVisibility((l) => {
+        const s = typeof l.source === "object" ? l.source.id : l.source;
+        const t = typeof l.target === "object" ? l.target.id : l.target;
+        return set.has(s) && set.has(t);
+      });
+  }
+
+  window.loadGraph = function (payload) {
+    const data = payload || { nodes: [], links: [] };
+    const { nodes, links, capped } = capSize(
+      data.nodes || [],
+      data.links || data.edges || []
+    );
+    rawData = {
+      nodes: nodes.map((n) => Object.assign({}, n)),
+      links: links.map((l) => Object.assign({}, l)),
+    };
+    neighborsIndex = buildNeighborsIndex(rawData.links);
+    for (const n of rawData.nodes) {
+      n.connections = connectionCount(n.id);
+    }
+
+    document.getElementById("status").style.display = "none";
+    document.getElementById("stats").textContent =
+      (capped ? "Showing top " + rawData.nodes.length + " of " + (data.nodes || []).length + " · " : "") +
+      rawData.nodes.length + " nodes · " + rawData.links.length + " edges";
+
+    const el = document.getElementById("graph");
+    while (el.firstChild) el.removeChild(el.firstChild);
+
+    Graph = ForceGraph3D()(el)
+      .graphData(rawData)
+      .backgroundColor("#0D2818")
+      .nodeResolution(8)
+      .nodeVal((n) => Math.max(1, Math.sqrt(n.connections || 1) * 4))
+      .nodeColor((n) => TYPE_COLORS[n.type] || "#3BAF78")
+      .nodeLabel((n) => n.name + " (" + (n.type || "unknown") + ")")
+      .nodeThreeObjectExtend(true)
+      .nodeThreeObject((n) => {
+        const sprite = buildLabelSprite(n.name || n.id, "#FFFFFF");
+        sprite.position.set(0, 10 + Math.sqrt(n.connections || 1) * 1.8, 0);
+        return sprite;
+      })
+      .linkColor(() => "#C2DDCE")
+      .linkOpacity(0.35)
+      .linkWidth((l) => Math.log((l.weight || 1) + 1))
+      .linkDirectionalParticles((l) => ((l.weight || 0) > 3 ? 2 : 0))
+      .linkDirectionalParticleSpeed(() => 0.006)
+      .linkDirectionalParticleWidth(1.5)
+      .linkDirectionalParticleColor(() => "#3BAF78")
+      .onNodeClick((node) => focusOnNode(node))
+      .onNodeRightClick(() => resetView())
+      .onBackgroundClick(() => resetView())
+      .onBackgroundRightClick(() => resetView())
+      .onNodeDrag(() => {})
+      .onNodeHover(() => {});
+    let lastClick = { id: null, t: 0 };
+    Graph.onNodeClick((node) => {
+      const now = Date.now();
+      if (lastClick.id === node.id && now - lastClick.t < 400) {
+        filterToNeighborhood(node, 2);
+      } else {
+        focusOnNode(node);
+      }
+      lastClick = { id: node.id, t: now };
+    });
+
+    Graph.cameraPosition({ x: 0, y: 0, z: 600 }, { x: 0, y: 0, z: 0 }, 0);
+  };
+
+  window.setMode = setMode;
+  window.resetView = resetView;
+
+  document.querySelectorAll(".mode-btn[data-mode]").forEach((b) => {
+    b.addEventListener("click", () => setMode(b.dataset.mode));
+  });
+  document.getElementById("reset-btn").addEventListener("click", resetView);
+})();
+</script>
+</body>
+</html>
